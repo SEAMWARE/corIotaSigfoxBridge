@@ -1,0 +1,203 @@
+#
+# FILE            iotasigfox_callbacks.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# The Sigfox backend's callbacks as DataChannel records, on the southbound port the broker serves for the plugin:
+#
+#   update           iotagent-sigfox's callback (GET /update?id=...&data=...), its README's mapping and data -
+#                    every device that calls on /update; @station (a callback variable) as an attribute
+#   sigfox/1A2B3C    one device, a Sigfox custom callback (POST, JSON): every type of the payload format -
+#                    int little-endian, uint, two bools of one byte, float, char
+#
+# The callback's time is the attribute's observedAt. A data too short for a field leaves the field out. The
+# errors are iotagent-sigfox's: no id or no data 400, a device no DataChannel has 404 - and data that is not
+# hex 400, a method that is not GET or POST 405.
+#
+--NAME--
+iotasigfox - Sigfox callbacks (GET as iotagent-sigfox, POST JSON) as DataChannel records, decoded by the payload format
+
+--TAGS--
+iotasigfox
+
+--INIT--
+rm -rf "${SIGFOX_TEST_DIR:?}"
+mkdir -p "$SIGFOX_TEST_DIR"
+cat > "$SIGFOX_TEST_DIR/bridges.json" <<EOF
+{
+  "iotasigfox": {
+    "southbound": { "port": $SIGFOX_SOUTH_PORT },
+    "ngsild": {
+      "defaultEntity": false,
+      "dataChannels": {
+        "update": { "channelInfo": [ { "key": "mapping", "value": "counter::uint:32  param1::uint:32 param2::uint:8 tempDegreesCelsius::uint:8  voltage::uint:16" } ],
+                    "entities": [ { "type": "Sensor", "id": "urn:ngsi-ld:Sensor:{@deviceId}",
+                                    "attributes": { "counter":     { "column": "counter" },
+                                                    "temperature": { "column": "tempDegreesCelsius" },
+                                                    "voltage":     { "column": "voltage" },
+                                                    "station":     { "column": "@station" } } } ] },
+        "sigfox/1A2B3C": { "channelInfo": [ { "key": "mapping", "value": "temp:0:int:16:little-endian hum::uint:8 door:3:bool:7 alarm:3:bool:0 level:4:float:32 tag:8:char:4" } ],
+                           "entities": [ { "type": "Tank", "id": "urn:ngsi-ld:Tank:{@deviceId}",
+                                           "attributes": { "temp": { "column": "temp" }, "hum": { "column": "hum" },
+                                                           "door": { "column": "door" }, "alarm": { "column": "alarm" },
+                                                           "level": { "column": "level" }, "tag": { "column": "tag" },
+                                                           "seqNumber": { "column": "@seqNumber" } } } ] }
+      }
+    }
+  }
+}
+EOF
+brokerStart
+
+--RUN--
+echo "01. GET /update - iotagent-sigfox's README example: counter 2, temperature 35, voltage 3183; its time the observedAt"
+echo "======================================================================================================================"
+callbackGet update 'id=dev1&data=000000020000000000230c6f&time=1760000000&station=0A1B&seqNumber=7'
+entityAwait urn:ngsi-ld:Sensor:dev1 '"voltage"'
+entityGet urn:ngsi-ld:Sensor:dev1
+echo
+echo
+
+
+echo "02. POST /sigfox, one device - int16 little-endian -125, uint8 55, door true, alarm false, float 21.3, char AB12"
+echo "================================================================================================================"
+callbackPost sigfox '{"device": "1A2B3C", "data": "83ff378041aa666641423132", "time": 1760000100, "seqNumber": 12, "ack": false}'
+entityAwait urn:ngsi-ld:Tank:1A2B3C '"tag"'
+entityGet urn:ngsi-ld:Tank:1A2B3C keyValues
+echo
+echo
+
+
+echo "03. The same device, 3 bytes of data - the fields past them left out: temp -1 and hum 60 change, the rest stays"
+echo "==============================================================================================================="
+callbackPost sigfox '{"device": "1A2B3C", "data": "ffff3c", "time": 1760000200, "seqNumber": 13}'
+entityAwait urn:ngsi-ld:Tank:1A2B3C '"hum": 60'
+entityGet urn:ngsi-ld:Tank:1A2B3C keyValues
+echo
+echo
+
+
+echo "04. No id, no data - iotagent-sigfox's 400 MANDATORY_FIELDS_NOT_FOUND"
+echo "====================================================================="
+callbackGet update 'data=00'
+callbackGet update 'id=dev1'
+callbackGet update 'time=1'
+echo
+echo
+
+
+echo "05. A device on a path no DataChannel has - 404 DEVICE_NOT_FOUND; another device on /sigfox too"
+echo "================================================================================================"
+callbackGet other 'id=dev1&data=00'
+callbackPost sigfox '{"device": "FFFF01", "data": "00"}'
+echo
+echo
+
+
+echo "06. Data that is not hex, or more than 12 bytes - 400; a PUT - 405"
+echo "=================================================================="
+callbackGet update 'id=dev1&data=zz'
+callbackGet update 'id=dev1&data=00112233445566778899aabbcc'
+curl -s -w "\n%{http_code}\n" -X PUT "localhost:$SIGFOX_SOUTH_PORT/update" | sed '/^$/d'
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+
+
+--EXPECT--
+01. GET /update - iotagent-sigfox's README example: counter 2, temperature 35, voltage 3183; its time the observedAt
+======================================================================================================================
+200
+{}
+{
+  "counter": {
+    "observedAt": "2025-10-09T08:53:20Z",
+    "type": "Property",
+    "value": 2
+  },
+  "id": "urn:ngsi-ld:Sensor:dev1",
+  "station": {
+    "observedAt": "2025-10-09T08:53:20Z",
+    "type": "Property",
+    "value": "0A1B"
+  },
+  "temperature": {
+    "observedAt": "2025-10-09T08:53:20Z",
+    "type": "Property",
+    "value": 35
+  },
+  "type": "Sensor",
+  "voltage": {
+    "observedAt": "2025-10-09T08:53:20Z",
+    "type": "Property",
+    "value": 3183
+  }
+}
+
+
+02. POST /sigfox, one device - int16 little-endian -125, uint8 55, door true, alarm false, float 21.3, char AB12
+================================================================================================================
+200
+{}
+{
+  "alarm": false,
+  "door": true,
+  "hum": 55,
+  "id": "urn:ngsi-ld:Tank:1A2B3C",
+  "level": 21.3,
+  "seqNumber": 12,
+  "tag": "AB12",
+  "temp": -125,
+  "type": "Tank"
+}
+
+
+03. The same device, 3 bytes of data - the fields past them left out: temp -1 and hum 60 change, the rest stays
+===============================================================================================================
+200
+{}
+{
+  "alarm": false,
+  "door": true,
+  "hum": 60,
+  "id": "urn:ngsi-ld:Tank:1A2B3C",
+  "level": 21.3,
+  "seqNumber": 13,
+  "tag": "AB12",
+  "temp": -1,
+  "type": "Tank"
+}
+
+
+04. No id, no data - iotagent-sigfox's 400 MANDATORY_FIELDS_NOT_FOUND
+=====================================================================
+400
+{"name":"MANDATORY_FIELDS_NOT_FOUND","message":"Some of the mandatory fields for the request were not found: [\"id\"]"}
+400
+{"name":"MANDATORY_FIELDS_NOT_FOUND","message":"Some of the mandatory fields for the request were not found: [\"data\"]"}
+400
+{"name":"MANDATORY_FIELDS_NOT_FOUND","message":"Some of the mandatory fields for the request were not found: [\"id\",\"data\"]"}
+
+
+05. A device on a path no DataChannel has - 404 DEVICE_NOT_FOUND; another device on /sigfox too
+================================================================================================
+404
+{"name":"DEVICE_NOT_FOUND","message":"No device was found with id:dev1"}
+404
+{"name":"DEVICE_NOT_FOUND","message":"No device was found with id:FFFF01"}
+
+
+06. Data that is not hex, or more than 12 bytes - 400; a PUT - 405
+==================================================================
+400
+{"name":"BAD_DATA","message":"the data is not 0 to 12 bytes of hex"}
+400
+{"name":"BAD_DATA","message":"the data is not 0 to 12 bytes of hex"}
+{"name":"METHOD_NOT_ALLOWED","message":"a callback is a GET or a POST"}
+405
+
+

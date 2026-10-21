@@ -1,0 +1,109 @@
+#
+# FILE            iotasigfox_config.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# The configuration: southbound idField names the callback's parameter that is the device (iotagent-sigfox's
+# idFieldName) - "device", Sigfox's own {device}, here. A DataChannel whose channelInfo the plugin refuses
+# carries nothing - a mapping with a type the grammar has not, a downlinkMapping longer than a downlink's 8
+# bytes, a key that is neither mapping nor downlinkMapping. An AssetChannel is refused: dormant, with why.
+#
+# REQUIRE_FEATURE: ASSET_CHANNELS
+#
+--NAME--
+iotasigfox - southbound idField; DataChannels with a channelInfo refused; an AssetChannel refused
+
+--TAGS--
+iotasigfox
+
+--INIT--
+rm -rf "${SIGFOX_TEST_DIR:?}"
+mkdir -p "$SIGFOX_TEST_DIR"
+cat > "$SIGFOX_TEST_DIR/bridges.json" <<EOF
+{
+  "iotasigfox": {
+    "southbound": { "port": $SIGFOX_SOUTH_PORT, "idField": "device" },
+    "ngsild": {
+      "defaultEntity": false,
+      "dataChannels": {
+        "good":      { "channelInfo": [ { "key": "mapping", "value": "t::int:8" } ],
+                       "entities": [ { "type": "T", "id": "urn:ngsi-ld:T:{@deviceId}", "attributes": { "t": { "column": "t" } } } ] },
+        "badType":   { "channelInfo": [ { "key": "mapping", "value": "t::double:8" } ],
+                       "entities": [ { "type": "T", "id": "urn:ngsi-ld:T:{@deviceId}", "attributes": { "t": { "column": "t" } } } ] },
+        "tooLong":   { "channelDirection": "both", "idEncoding": "percent",
+                       "channelInfo": [ { "key": "downlinkMapping", "value": "a::uint:64 b::uint:8" } ],
+                       "entities": [ { "type": "T", "id": "urn:ngsi-ld:T:{@deviceId}", "attributes": { "a": { "column": "a" } } } ] },
+        "typo":      { "channelInfo": [ { "key": "maping", "value": "t::int:8" } ],
+                       "entities": [ { "type": "T", "id": "urn:ngsi-ld:T:{@deviceId}", "attributes": { "t": { "column": "t" } } } ] }
+      },
+      "assetChannels": { "plant": { "entities": "natural" } }
+    }
+  }
+}
+EOF
+brokerStart
+
+--RUN--
+echo "01. idField device - a callback's device in 'device'; with 'id' only, 400 naming 'device'"
+echo "========================================================================================="
+callbackGet good 'device=D1&data=f6'
+entityAwait urn:ngsi-ld:T:D1 '"t": -10'
+entityGet urn:ngsi-ld:T:D1 keyValues
+callbackGet good 'id=D1&data=f6'
+echo
+echo
+
+
+echo "02. The DataChannels the plugin refused carry nothing - 404 DEVICE_NOT_FOUND"
+echo "============================================================================"
+callbackGet badType 'device=D1&data=f6'
+callbackGet tooLong 'device=D1&data=f6'
+callbackGet typo 'device=D1&data=f6'
+echo
+echo
+
+
+echo "03. The AssetChannel - dormant, with why"
+echo "========================================"
+curl -s "localhost:$SIGFOX_PORT/ngsi-ld/v1/assetChannels" | python3 -c '
+import json, sys
+for c in json.load(sys.stdin):
+    print(c["channelTarget"], c.get("status"), c.get("statusReason"))'
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+
+
+--EXPECT--
+01. idField device - a callback's device in 'device'; with 'id' only, 400 naming 'device'
+=========================================================================================
+200
+{}
+{
+  "id": "urn:ngsi-ld:T:D1",
+  "t": -10,
+  "type": "T"
+}
+400
+{"name":"MANDATORY_FIELDS_NOT_FOUND","message":"Some of the mandatory fields for the request were not found: [\"device\"]"}
+
+
+02. The DataChannels the plugin refused carry nothing - 404 DEVICE_NOT_FOUND
+============================================================================
+404
+{"name":"DEVICE_NOT_FOUND","message":"No device was found with id:D1"}
+404
+{"name":"DEVICE_NOT_FOUND","message":"No device was found with id:D1"}
+404
+{"name":"DEVICE_NOT_FOUND","message":"No device was found with id:D1"}
+
+
+03. The AssetChannel - dormant, with why
+========================================
+plant dormant the iotasigfox bridge carries DataChannels only - a callback is a record
+
+

@@ -1,0 +1,181 @@
+#
+# FILE            iotasigfox_downlinks.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# DataChannel write-back (channelDirection both) as Sigfox downlinks: a client's write to a mapped attribute is
+# encoded by the DataChannel's downlinkMapping into the device's queued downlink - 8 bytes - and is the answer to
+# the device's next bidirectional callback (ack true): { "<device>": { "downlinkData": "<hex>" } }. A callback
+# that is not bidirectional leaves it queued; with none queued a bidirectional one is answered 204.
+#
+# Writes before the device calls back are one downlink, a field not written 0. A column the downlinkMapping has
+# not, or a value its field cannot hold, is refused: 400, nothing stored. A DataChannel without a downlinkMapping
+# takes no writes: 422.
+#
+# REQUIRE_FEATURE: CHANNEL_WRITE_BACK
+#
+--NAME--
+iotasigfox - written attributes as the downlink of the device's next bidirectional callback
+
+--TAGS--
+iotasigfox
+
+--INIT--
+rm -rf "${SIGFOX_TEST_DIR:?}"
+mkdir -p "$SIGFOX_TEST_DIR"
+cat > "$SIGFOX_TEST_DIR/bridges.json" <<EOF
+{
+  "iotasigfox": {
+    "southbound": { "port": $SIGFOX_SOUTH_PORT },
+    "ngsild": {
+      "defaultEntity": false,
+      "dataChannels": {
+        "lamps": { "channelDirection": "both", "idEncoding": "percent",
+                   "channelInfo": [ { "key": "mapping",         "value": "led::uint:8 period::uint:16 armed:3:bool:0 counter:4:uint:16" },
+                                    { "key": "downlinkMapping", "value": "led::uint:8 period::uint:16 armed:3:bool:0" } ],
+                   "entities": [ { "type": "Lamp", "id": "urn:ngsi-ld:Lamp:{@deviceId}",
+                                   "attributes": { "led": { "column": "led" }, "period": { "column": "period" },
+                                                   "armed": { "column": "armed" }, "counter": { "column": "counter" } } } ] },
+        "meters": { "channelDirection": "both", "idEncoding": "percent",
+                    "channelInfo": [ { "key": "mapping", "value": "kwh::uint:16" } ],
+                    "entities": [ { "type": "Meter", "id": "urn:ngsi-ld:Meter:{@deviceId}",
+                                    "attributes": { "kwh": { "column": "kwh" } } } ] }
+      }
+    }
+  }
+}
+EOF
+brokerStart
+
+--RUN--
+echo "01. The lamp's first message - led 1, period 100, armed true, counter 5"
+echo "======================================================================"
+callbackGet lamps 'id=A1B2C3&data=010064010005&time=1760000000'
+entityAwait urn:ngsi-ld:Lamp:A1B2C3 '"counter": 5'
+echo
+echo
+
+
+echo "02. PATCH led 3 - queued; the entity has it"
+echo "==========================================="
+attrPatch urn:ngsi-ld:Lamp:A1B2C3 led 3
+entityGet urn:ngsi-ld:Lamp:A1B2C3 keyValues
+echo
+echo
+
+
+echo "03. A callback that is not bidirectional - 200 {}, the downlink stays queued"
+echo "============================================================================"
+callbackGet lamps 'id=A1B2C3&data=&ack=false'
+echo
+echo
+
+
+echo "04. The bidirectional callback (ack true) - the downlink: led 3, the rest 0; the next one has none, 204"
+echo "======================================================================================================"
+callbackGet lamps 'id=A1B2C3&data=&ack=true'
+callbackGet lamps 'id=A1B2C3&data=&ack=true'
+echo
+echo
+
+
+echo "05. Three writes, one downlink - led 1, period 600 (0x0258), armed true; a Sigfox custom callback (POST, ack a boolean)"
+echo "======================================================================================================================"
+attrPatch urn:ngsi-ld:Lamp:A1B2C3 led 1
+attrPatch urn:ngsi-ld:Lamp:A1B2C3 period 600
+attrPatch urn:ngsi-ld:Lamp:A1B2C3 armed true
+callbackPost lamps '{"device": "A1B2C3", "data": "", "ack": true}'
+echo
+echo
+
+
+echo "06. Refused, nothing stored - counter (not in the downlinkMapping), led 300 (a uint8), led \"on\": 400"
+echo "===================================================================================================="
+attrPatch urn:ngsi-ld:Lamp:A1B2C3 counter 9
+attrPatch urn:ngsi-ld:Lamp:A1B2C3 led 300
+attrPatch urn:ngsi-ld:Lamp:A1B2C3 led '"on"'
+entityGet urn:ngsi-ld:Lamp:A1B2C3 keyValues
+callbackGet lamps 'id=A1B2C3&data=&ack=true'
+echo
+echo
+
+
+echo "07. A DataChannel without a downlinkMapping - a write 422"
+echo "========================================================="
+callbackGet meters 'id=M1&data=0102'
+entityAwait urn:ngsi-ld:Meter:M1 '"kwh": 258'
+attrPatch urn:ngsi-ld:Meter:M1 kwh 7
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+
+
+--EXPECT--
+01. The lamp's first message - led 1, period 100, armed true, counter 5
+======================================================================
+200
+{}
+
+
+02. PATCH led 3 - queued; the entity has it
+===========================================
+PATCH led: 204
+{
+  "armed": true,
+  "counter": 5,
+  "id": "urn:ngsi-ld:Lamp:A1B2C3",
+  "led": 3,
+  "period": 100,
+  "type": "Lamp"
+}
+
+
+03. A callback that is not bidirectional - 200 {}, the downlink stays queued
+============================================================================
+200
+{}
+
+
+04. The bidirectional callback (ack true) - the downlink: led 3, the rest 0; the next one has none, 204
+======================================================================================================
+200
+{"A1B2C3":{"downlinkData":"0300000000000000"}}
+204
+
+
+05. Three writes, one downlink - led 1, period 600 (0x0258), armed true; a Sigfox custom callback (POST, ack a boolean)
+======================================================================================================================
+PATCH led: 204
+PATCH period: 204
+PATCH armed: 204
+200
+{"A1B2C3":{"downlinkData":"0102580100000000"}}
+
+
+06. Refused, nothing stored - counter (not in the downlinkMapping), led 300 (a uint8), led "on": 400
+====================================================================================================
+PATCH counter: 400
+PATCH led: 400
+PATCH led: 400
+{
+  "armed": true,
+  "counter": 5,
+  "id": "urn:ngsi-ld:Lamp:A1B2C3",
+  "led": 1,
+  "period": 600,
+  "type": "Lamp"
+}
+204
+
+
+07. A DataChannel without a downlinkMapping - a write 422
+=========================================================
+200
+{}
+PATCH kwh: 422
+
+
